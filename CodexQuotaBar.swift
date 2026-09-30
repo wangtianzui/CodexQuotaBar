@@ -57,6 +57,7 @@ private enum CodexIcon {
         "/Applications/ChatGPT.app/Contents/Resources/icon-codex-light.png",
         "/Applications/Codex.app/Contents/Resources/icon-codex-light.png"
     ].compactMap { NSImage(contentsOfFile: $0) }.first
+
 }
 
 private struct ComparisonBaseline: Codable {
@@ -766,11 +767,45 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private func makeStatusImage(first: String, second: String, warning: Bool) -> NSImage {
         let size = NSSize(width: 83, height: 22)
         let image = NSImage(size: size, flipped: false) { rect in
-            if let icon = CodexIcon.image {
-                let source = NSRect(origin: .zero, size: icon.size)
-                    .insetBy(dx: icon.size.width * 0.095, dy: icon.size.height * 0.095)
-                icon.draw(in: NSRect(x: 0, y: 0, width: 22, height: 22), from: source, operation: .sourceOver, fraction: 1)
+            NSColor.black.setStroke()
+            // Six linked loops echo a knot; an open segment distinguishes quota.
+            for index in 0..<6 {
+                NSGraphicsContext.saveGraphicsState()
+                let transform = AffineTransform(
+                    translationByX: 11, byY: 11)
+                var rotation = transform
+                rotation.rotate(byDegrees: CGFloat(index) * 60)
+                rotation.translate(x: -11, y: -11)
+                (rotation as NSAffineTransform).concat()
+                let loop = NSBezierPath(roundedRect: NSRect(x: 8, y: 9, width: 7, height: 11), xRadius: 3.5, yRadius: 3.5)
+                loop.lineWidth = 1.45
+                loop.stroke()
+                NSGraphicsContext.restoreGraphicsState()
             }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.compositingOperation = .clear
+            let center = NSBezierPath()
+            for index in 0..<6 {
+                let angle = Double(index) * .pi / 3
+                let point = NSPoint(x: 11 + cos(angle) * 2.8, y: 11 + sin(angle) * 2.8)
+                if index == 0 { center.move(to: point) } else { center.line(to: point) }
+            }
+            center.close()
+            center.fill()
+            NSBezierPath(rect: NSRect(x: 16.6, y: 3.3, width: 3.2, height: 2.2)).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.cgContext.setBlendMode(.sourceAtop)
+            NSGradient(colors: [
+                NSColor(red: 0.96, green: 0.78, blue: 0.80, alpha: 1),
+                NSColor(red: 0.96, green: 0.84, blue: 0.74, alpha: 1),
+                NSColor(red: 0.94, green: 0.91, blue: 0.74, alpha: 1),
+                NSColor(red: 0.76, green: 0.91, blue: 0.81, alpha: 1),
+                NSColor(red: 0.75, green: 0.89, blue: 0.93, alpha: 1),
+                NSColor(red: 0.80, green: 0.83, blue: 0.96, alpha: 1),
+                NSColor(red: 0.90, green: 0.80, blue: 0.94, alpha: 1)
+            ])?.draw(in: NSRect(x: 0, y: 0, width: 22, height: 22), angle: 45)
+            NSGraphicsContext.restoreGraphicsState()
             let style = NSMutableParagraphStyle()
             style.alignment = .left
             style.lineBreakMode = .byClipping
@@ -784,6 +819,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
             second.draw(in: NSRect(x: 26, y: 0, width: rect.width - 26, height: 11), withAttributes: attributes)
             return true
         }
+        image.isTemplate = false
         return image
     }
 
