@@ -68,6 +68,17 @@ private struct ComparisonBaseline: Codable {
     let coversWindowStart: Bool
 }
 
+private struct IdleQuotaReading: Codable {
+    let weeklyResetAt: TimeInterval
+    let weeklyUsed: Double
+    let recordedAt: TimeInterval
+}
+
+private struct ComparisonCache: Codable {
+    let baseline: ComparisonBaseline?
+    let idle: IdleQuotaReading?
+}
+
 private struct ComparisonSnapshot {
     let weeklyIncrease: Double
     let coversWindowStart: Bool
@@ -75,11 +86,30 @@ private struct ComparisonSnapshot {
 
 private final class ComparisonTracker {
     private let storageKey = "quotaComparisonBaseline"
+    private let cacheURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/CodexQuotaBar/comparison.json")
     private var baseline: ComparisonBaseline?
+    private var idle: IdleQuotaReading?
+    private var recoveryAttemptedFor: String?
 
     init() {
-        if let data = UserDefaults.standard.data(forKey: storageKey) {
+        if let data = try? Data(contentsOf: cacheURL),
+           let cache = try? JSONDecoder().decode(ComparisonCache.self, from: data) {
+            baseline = cache.baseline
+            idle = cache.idle
+        } else if let data = UserDefaults.standard.data(forKey: storageKey) {
             baseline = try? JSONDecoder().decode(ComparisonBaseline.self, from: data)
+            save()
+        }
+    }
+
+    private func save() {
+        do {
+            try FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(ComparisonCache(baseline: baseline, idle: idle))
+            try data.write(to: cacheURL, options: .atomic)
+        } catch {
+            QuotaLog.write("Comparison cache save failed: \(error.localizedDescription)")
         }
     }
 
@@ -89,19 +119,42 @@ private final class ComparisonTracker {
               let fiveReset = five.resetsAt, let weeklyReset = weekly.resetsAt,
               let duration = five.windowDurationMins else { return nil }
         let now = date.timeIntervalSince1970
+        let windowStart = fiveReset - Double(duration * 60)
+        if fiveUsed == 0 || now >= fiveReset {
+            idle = IdleQuotaReading(weeklyResetAt: weeklyReset, weeklyUsed: weeklyUsed, recordedAt: now)
+            if fiveUsed == 0 {
+                baseline = ComparisonBaseline(fiveHourResetAt: fiveReset, weeklyResetAt: weeklyReset, fiveHourUsed: 0, weeklyUsed: weeklyUsed, recordedAt: now, coversWindowStart: true)
+            }
+            save()
+            return ComparisonSnapshot(weeklyIncrease: 0, coversWindowStart: true)
+        }
         if baseline == nil || baseline?.fiveHourResetAt != fiveReset || baseline?.weeklyResetAt != weeklyReset ||
             fiveUsed < (baseline?.fiveHourUsed ?? 0) || weeklyUsed < (baseline?.weeklyUsed ?? 0) {
-            let windowStart = fiveReset - Double(duration * 60)
+            // The last idle poll belongs to the moment before first use. Avoid
+            // treating a stale cache from hours ago as the start of this window.
+            let startReading = idle.flatMap { reading -> IdleQuotaReading? in
+                guard reading.weeklyResetAt == weeklyReset, reading.weeklyUsed <= weeklyUsed,
+                      reading.recordedAt <= windowStart, windowStart - reading.recordedAt <= 120 else { return nil }
+                return reading
+            }
             baseline = ComparisonBaseline(
                 fiveHourResetAt: fiveReset,
                 weeklyResetAt: weeklyReset,
-                fiveHourUsed: fiveUsed,
-                weeklyUsed: weeklyUsed,
-                recordedAt: now,
-                coversWindowStart: now - windowStart <= 120
+                fiveHourUsed: startReading == nil ? fiveUsed : 0,
+                weeklyUsed: startReading?.weeklyUsed ?? weeklyUsed,
+                recordedAt: startReading?.recordedAt ?? now,
+                coversWindowStart: startReading != nil
             )
-            if let data = try? JSONEncoder().encode(baseline) {
-                UserDefaults.standard.set(data, forKey: storageKey)
+            save()
+            QuotaLog.write("Started five-hour comparison: fiveReset=\(fiveReset), idleBaseline=\(startReading != nil)")
+        }
+        let recoveryKey = "\(fiveReset):\(weeklyReset)"
+        if baseline?.coversWindowStart == false && recoveryAttemptedFor != recoveryKey {
+            recoveryAttemptedFor = recoveryKey
+            if let recovered = recoverBaseline(fiveReset: fiveReset, weeklyReset: weeklyReset, windowStart: fiveReset - Double(duration * 60), now: now) {
+            baseline = recovered
+            save()
+            QuotaLog.write("Recovered comparison baseline: weeklyUsed=\(recovered.weeklyUsed), fiveReset=\(fiveReset)")
             }
         }
         guard let baseline else { return nil }
@@ -109,6 +162,56 @@ private final class ComparisonTracker {
             weeklyIncrease: max(0, weeklyUsed - baseline.weeklyUsed),
             coversWindowStart: baseline.coversWindowStart
         )
+    }
+
+    // Recover only quota events at zero usage in this exact window. Never infer
+    // a weekly percentage from the five-hour percentage.
+    private func recoverBaseline(fiveReset: TimeInterval, weeklyReset: TimeInterval, windowStart: TimeInterval, now: TimeInterval) -> ComparisonBaseline? {
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
+        let timestampParser = ISO8601DateFormatter()
+        timestampParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var earliest: ComparisonBaseline?
+        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { return nil }
+        // An old conversation can remain active today, so use file modification
+        // time rather than the date in its directory name.
+        for case let file as URL in files where file.pathExtension == "jsonl" {
+            guard let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                  modified.timeIntervalSince1970 >= windowStart,
+                  let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                for line in text.split(separator: "\n") where line.contains("token_count") && line.contains(String(Int(fiveReset))) {
+                    guard let data = line.data(using: .utf8),
+                          let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          event["type"] as? String == "event_msg",
+                          let payload = event["payload"] as? [String: Any], payload["type"] as? String == "token_count",
+                          let rates = payload["rate_limits"] as? [String: Any],
+                          let primary = rates["primary"] as? [String: Any], let secondary = rates["secondary"] as? [String: Any],
+                          (primary["resets_at"] as? Double) == fiveReset, (secondary["resets_at"] as? Double) == weeklyReset,
+                          (primary["used_percent"] as? Double) == 0, let weeklyUsed = secondary["used_percent"] as? Double,
+                          let stamp = event["timestamp"] as? String, let date = timestampParser.date(from: stamp) else { continue }
+                    let recorded = date.timeIntervalSince1970
+                    guard recorded >= windowStart, recorded <= now, recorded < (earliest?.recordedAt ?? .infinity) else { continue }
+                    earliest = ComparisonBaseline(fiveHourResetAt: fiveReset, weeklyResetAt: weeklyReset, fiveHourUsed: 0, weeklyUsed: weeklyUsed, recordedAt: recorded, coversWindowStart: true)
+                }
+        }
+        return earliest
+    }
+}
+
+private enum QuotaLog {
+    static func write(_ message: String) {
+        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/CodexQuotaBar")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("quota.log")
+        let entry = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        guard let data = entry.data(using: .utf8) else { return }
+        if let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 262144 {
+            try? FileManager.default.removeItem(at: file)
+        }
+        if !FileManager.default.fileExists(atPath: file.path) { FileManager.default.createFile(atPath: file.path, contents: nil) }
+        guard let handle = try? FileHandle(forWritingTo: file) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
     }
 }
 
@@ -423,9 +526,6 @@ private struct QuotaPanel: View {
                 if isWeekly {
                     Text(weeklyChangeLabel)
                         .help(state.comparison?.coversWindowStart == true ? "本轮 5 小时内，7 天剩余额度下降的百分点" : "下一次 5 小时重置后开始记录整轮变化")
-                    Spacer(minLength: 0)
-                    Text(state.short?.usedPercent.map { "5小时 −\(Int($0.rounded()))%" } ?? "5小时 —%")
-                        .help("当前 5 小时额度已使用的比例")
                 } else {
                     Text(used.map { "5小时 −\(Int($0.rounded()))%" } ?? "5小时 —%")
                         .help("当前 5 小时额度已使用的比例")
@@ -574,7 +674,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         let preview = CommandLine.arguments.contains("--preview")
         NSApp.setActivationPolicy(preview ? .regular : .accessory)
-        statusItem = NSStatusBar.system.statusItem(withLength: 82)
+        statusItem = NSStatusBar.system.statusItem(withLength: 87)
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "Codex 额度"
         statusItem.button?.target = self
@@ -628,8 +728,10 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
                     self.tokenActivity = reading.tokenActivity
                     self.resetCredits = reading.resetCredits
                     self.comparison = self.comparisonTracker.update(reading.limits, at: self.lastUpdated!)
+                    QuotaLog.write("Quota: fiveUsed=\(reading.limits.primary?.usedPercent.map { String($0) } ?? "nil"), weeklyUsed=\(reading.limits.secondary?.usedPercent.map { String($0) } ?? "nil"), weeklyChange=\(self.comparison?.weeklyIncrease.description ?? "nil"), completeBaseline=\(self.comparison?.coversWindowStart.description ?? "nil")")
                 case .failure(let error):
                     self.errorMessage = error.localizedDescription
+                    QuotaLog.write("Quota refresh failed: \(error.localizedDescription)")
                 }
                 self.render()
             }
@@ -662,9 +764,13 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     }
 
     private func makeStatusImage(first: String, second: String, warning: Bool) -> NSImage {
-        let size = NSSize(width: 78, height: 22)
+        let size = NSSize(width: 83, height: 22)
         let image = NSImage(size: size, flipped: false) { rect in
-            CodexIcon.image?.draw(in: NSRect(x: 0, y: 2, width: 18, height: 18))
+            if let icon = CodexIcon.image {
+                let source = NSRect(origin: .zero, size: icon.size)
+                    .insetBy(dx: icon.size.width * 0.095, dy: icon.size.height * 0.095)
+                icon.draw(in: NSRect(x: 0, y: 0, width: 22, height: 22), from: source, operation: .sourceOver, fraction: 1)
+            }
             let style = NSMutableParagraphStyle()
             style.alignment = .left
             style.lineBreakMode = .byClipping
@@ -674,8 +780,8 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
                 .paragraphStyle: style
             ]
             let firstLine = (warning ? "! " : "") + first
-            firstLine.draw(in: NSRect(x: 21, y: 11, width: rect.width - 21, height: 11), withAttributes: attributes)
-            second.draw(in: NSRect(x: 21, y: 0, width: rect.width - 21, height: 11), withAttributes: attributes)
+            firstLine.draw(in: NSRect(x: 26, y: 11, width: rect.width - 26, height: 11), withAttributes: attributes)
+            second.draw(in: NSRect(x: 26, y: 0, width: rect.width - 26, height: 11), withAttributes: attributes)
             return true
         }
         return image
