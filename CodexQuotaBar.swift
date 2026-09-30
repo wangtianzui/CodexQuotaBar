@@ -15,8 +15,19 @@ private struct RateLimits: Decodable {
 
 private struct RateLimitResponse: Decodable {
     let rateLimits: RateLimits?
+    let rateLimitResetCredits: ResetCredits?
     let summary: TokenSummary?
     let dailyUsageBuckets: [TokenDailyBucket]?
+}
+
+private struct ResetCredits: Decodable {
+    let availableCount: Int
+    let credits: [ResetCredit]
+}
+
+private struct ResetCredit: Decodable {
+    let status: String
+    let expiresAt: TimeInterval?
 }
 
 private struct TokenSummary: Decodable {
@@ -35,7 +46,17 @@ private struct TokenActivity {
 
 private struct QuotaReading {
     let limits: RateLimits
+    let resetCredits: ResetCredits?
     let tokenActivity: TokenActivity?
+}
+
+private enum CodexIcon {
+    static let image: NSImage? = [
+        "/Applications/ChatGPT.app/Contents/Resources/icon-codex-dark-color.png",
+        "/Applications/Codex.app/Contents/Resources/icon-codex-dark-color.png",
+        "/Applications/ChatGPT.app/Contents/Resources/icon-codex-light.png",
+        "/Applications/Codex.app/Contents/Resources/icon-codex-light.png"
+    ].compactMap { NSImage(contentsOfFile: $0) }.first
 }
 
 private struct ComparisonBaseline: Codable {
@@ -145,7 +166,7 @@ private final class QuotaReader {
         let requests = [
             #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-quota-bar","version":"1.0"}}}"#,
             #"{"method":"initialized"}"#,
-            #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}"#,
+            #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":false}}"#,
             #"{"id":3,"method":"account/usage/read","params":{}}"#
         ].joined(separator: "\n") + "\n"
         input.fileHandleForWriting.write(Data(requests.utf8))
@@ -154,6 +175,7 @@ private final class QuotaReader {
         let usageReady = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var quotaAnswer: Result<RateLimits, Error>?
+        var resetCredits: ResetCredits?
         var tokenAnswer: TokenActivity?
         DispatchQueue.global(qos: .utility).async {
             var buffer = Data()
@@ -176,6 +198,7 @@ private final class QuotaReader {
                         }
                         lock.lock()
                         quotaAnswer = result
+                        resetCredits = response.result?.rateLimitResetCredits
                         lock.unlock()
                         hasQuota = true
                         quotaReady.signal()
@@ -206,9 +229,10 @@ private final class QuotaReader {
         _ = usageReady.wait(timeout: .now() + 2)
         lock.lock()
         let quota = quotaAnswer
+        let credits = resetCredits
         let tokens = tokenAnswer
         lock.unlock()
-        return QuotaReading(limits: try quota!.get(), tokenActivity: tokens)
+        return QuotaReading(limits: try quota!.get(), resetCredits: credits, tokenActivity: tokens)
     }
 }
 
@@ -220,6 +244,7 @@ private final class PanelState: ObservableObject {
     @Published var errorMessage: String?
     @Published var refreshInProgress = false
     @Published var tokenActivity: TokenActivity?
+    @Published var resetCredits: ResetCredits?
     @Published var comparison: ComparisonSnapshot?
 }
 
@@ -257,11 +282,18 @@ private struct QuotaPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Text("C")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .background(fiveHourColor.gradient, in: RoundedRectangle(cornerRadius: 10))
+                Group {
+                    if let icon = CodexIcon.image {
+                        Image(nsImage: icon).resizable().scaledToFit()
+                    } else {
+                        Image(systemName: "terminal.fill")
+                            .font(.system(size: 19, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(fiveHourColor.gradient, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .frame(width: 38, height: 38)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex 额度")
                         .font(.system(size: 16, weight: .semibold))
@@ -289,6 +321,10 @@ private struct QuotaPanel: View {
                 VStack(alignment: .leading, spacing: 10) {
                     quotaCard(title: "5 小时", symbol: "clock", window: state.short, color: fiveHourColor, isWeekly: false)
                     quotaCard(title: "7 天", symbol: "calendar", window: state.weekly, color: weeklyColor, isWeekly: true)
+
+                    if let resetCredits = state.resetCredits {
+                        resetCreditCard(resetCredits)
+                    }
 
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -424,6 +460,47 @@ private struct QuotaPanel: View {
         }
     }
 
+    private func resetCreditCard(_ summary: ResetCredits) -> some View {
+        let available = summary.credits
+            .filter { $0.status == "available" && ($0.expiresAt ?? 0) > Date().timeIntervalSince1970 }
+            .sorted { ($0.expiresAt ?? .infinity) < ($1.expiresAt ?? .infinity) }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("额度重置券", systemImage: "arrow.counterclockwise.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text("可用 \(summary.availableCount) 次")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(fiveHourColor)
+            }
+            ForEach(Array(available.enumerated()), id: \.offset) { index, credit in
+                HStack {
+                    Text("第 \(index + 1) 次")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(credit.expiresAt.map { "有效期至 \(formatCreditExpiry($0))" } ?? "有效期未知")
+                        .monospacedDigit()
+                }
+                .font(.system(size: 11))
+            }
+            if available.isEmpty {
+                Text("暂无可用重置券")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.08)))
+    }
+
+    private func formatCreditExpiry(_ timestamp: TimeInterval) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+
     private func formatPoints(_ value: Double) -> String {
         value.rounded() == value ? String(format: "%.0f", value) : String(format: "%.1f", value)
     }
@@ -487,6 +564,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private var lastUpdated: Date?
     private var errorMessage: String?
     private var tokenActivity: TokenActivity?
+    private var resetCredits: ResetCredits?
     private let comparisonTracker = ComparisonTracker()
     private var comparison: ComparisonSnapshot?
     private var refreshInProgress = false
@@ -496,7 +574,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         let preview = CommandLine.arguments.contains("--preview")
         NSApp.setActivationPolicy(preview ? .regular : .accessory)
-        statusItem = NSStatusBar.system.statusItem(withLength: 70)
+        statusItem = NSStatusBar.system.statusItem(withLength: 82)
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "Codex 额度"
         statusItem.button?.target = self
@@ -548,6 +626,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
                     self.lastUpdated = Date()
                     self.errorMessage = nil
                     self.tokenActivity = reading.tokenActivity
+                    self.resetCredits = reading.resetCredits
                     self.comparison = self.comparisonTracker.update(reading.limits, at: self.lastUpdated!)
                 case .failure(let error):
                     self.errorMessage = error.localizedDescription
@@ -578,26 +657,27 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
         panelState.errorMessage = errorMessage
         panelState.refreshInProgress = refreshInProgress
         panelState.tokenActivity = tokenActivity
+        panelState.resetCredits = resetCredits
         panelState.comparison = comparison
     }
 
     private func makeStatusImage(first: String, second: String, warning: Bool) -> NSImage {
-        let size = NSSize(width: 62, height: 22)
+        let size = NSSize(width: 78, height: 22)
         let image = NSImage(size: size, flipped: false) { rect in
+            CodexIcon.image?.draw(in: NSRect(x: 0, y: 2, width: 18, height: 18))
             let style = NSMutableParagraphStyle()
-            style.alignment = .center
+            style.alignment = .left
             style.lineBreakMode = .byClipping
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold),
-                .foregroundColor: NSColor.black,
+                .foregroundColor: NSColor.labelColor,
                 .paragraphStyle: style
             ]
             let firstLine = (warning ? "! " : "") + first
-            firstLine.draw(in: NSRect(x: 0, y: 11, width: rect.width, height: 11), withAttributes: attributes)
-            second.draw(in: NSRect(x: 0, y: 0, width: rect.width, height: 11), withAttributes: attributes)
+            firstLine.draw(in: NSRect(x: 21, y: 11, width: rect.width - 21, height: 11), withAttributes: attributes)
+            second.draw(in: NSRect(x: 21, y: 0, width: rect.width - 21, height: 11), withAttributes: attributes)
             return true
         }
-        image.isTemplate = true
         return image
     }
 
