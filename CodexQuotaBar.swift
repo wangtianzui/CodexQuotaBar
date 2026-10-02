@@ -178,6 +178,12 @@ private final class ComparisonTracker {
         }
     }
 
+    // The backend may round the same reset timestamp by one second.
+    private func sameReset(_ lhs: TimeInterval?, _ rhs: TimeInterval) -> Bool {
+        guard let lhs else { return false }
+        return abs(lhs - rhs) <= 2
+    }
+
     private func save() {
         do {
             try FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -203,13 +209,13 @@ private final class ComparisonTracker {
             save()
             return ComparisonSnapshot(weeklyIncrease: 0, coversWindowStart: true)
         }
-        if baseline == nil || baseline?.fiveHourResetAt != fiveReset || baseline?.weeklyResetAt != weeklyReset ||
+        if baseline == nil || !sameReset(baseline?.fiveHourResetAt, fiveReset) || !sameReset(baseline?.weeklyResetAt, weeklyReset) ||
             fiveUsed < (baseline?.fiveHourUsed ?? 0) || weeklyUsed < (baseline?.weeklyUsed ?? 0) {
             // The last idle poll belongs to the moment before first use. Avoid
             // treating a stale cache from hours ago as the start of this window.
             let startReading = idle.flatMap { reading -> IdleQuotaReading? in
-                guard reading.weeklyResetAt == weeklyReset, reading.weeklyUsed <= weeklyUsed,
-                      reading.recordedAt <= windowStart, windowStart - reading.recordedAt <= 120 else { return nil }
+                guard sameReset(reading.weeklyResetAt, weeklyReset), reading.weeklyUsed <= weeklyUsed,
+                      reading.recordedAt <= windowStart + 2, windowStart - reading.recordedAt <= 120 else { return nil }
                 return reading
             }
             baseline = ComparisonBaseline(
@@ -253,18 +259,18 @@ private final class ComparisonTracker {
             guard let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                   modified.timeIntervalSince1970 >= windowStart,
                   let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-                for line in text.split(separator: "\n") where line.contains("token_count") && line.contains(String(Int(fiveReset))) {
+                for line in text.split(separator: "\n") where line.contains("token_count") {
                     guard let data = line.data(using: .utf8),
                           let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                           event["type"] as? String == "event_msg",
                           let payload = event["payload"] as? [String: Any], payload["type"] as? String == "token_count",
                           let rates = payload["rate_limits"] as? [String: Any],
                           let primary = rates["primary"] as? [String: Any], let secondary = rates["secondary"] as? [String: Any],
-                          (primary["resets_at"] as? Double) == fiveReset, (secondary["resets_at"] as? Double) == weeklyReset,
+                          sameReset(primary["resets_at"] as? Double, fiveReset), sameReset(secondary["resets_at"] as? Double, weeklyReset),
                           (primary["used_percent"] as? Double) == 0, let weeklyUsed = secondary["used_percent"] as? Double,
                           let stamp = event["timestamp"] as? String, let date = timestampParser.date(from: stamp) else { continue }
                     let recorded = date.timeIntervalSince1970
-                    guard recorded >= windowStart, recorded <= now, recorded < (earliest?.recordedAt ?? .infinity) else { continue }
+                    guard recorded >= windowStart - 2, recorded <= now, recorded < (earliest?.recordedAt ?? .infinity) else { continue }
                     earliest = ComparisonBaseline(fiveHourResetAt: fiveReset, weeklyResetAt: weeklyReset, fiveHourUsed: 0, weeklyUsed: weeklyUsed, recordedAt: recorded, coversWindowStart: true)
                 }
         }
