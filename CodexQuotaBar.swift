@@ -44,6 +44,80 @@ private struct TokenActivity {
     let latestDay: TokenDailyBucket?
 }
 
+private final class LocalTokenReader: @unchecked Sendable {
+    private let lock = NSRecursiveLock()
+    private struct FileState {
+        var offset: UInt64 = 0
+        var previous: Int64 = 0
+        var pending = Data()
+    }
+    private var files: [String: FileState] = [:]
+    private var seen = Set<String>()
+    private var day: Date?
+    private var tokens: Int64 = 0
+    private let root: URL
+
+    init(root: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")) {
+        self.root = root
+    }
+
+    // Incremental cumulative deltas avoid counting repeated token notifications twice.
+    func read(at now: Date = Date(), calendar: Calendar = .current) -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        let start = calendar.startOfDay(for: now)
+        let end = calendar.date(byAdding: .day, value: 1, to: start)!
+        if day != start {
+            files.removeAll(); seen.removeAll(); tokens = 0; day = start
+        }
+        guard FileManager.default.isReadableFile(atPath: root.path),
+              let entries = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plainFormatter = ISO8601DateFormatter()
+        for case let url as URL in entries where url.pathExtension == "jsonl" {
+            guard let attributes = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let modified = attributes.contentModificationDate, modified >= start,
+                  let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? handle.close() }
+            var state = files[url.path] ?? FileState()
+            // A replaced/truncated log requires rebuilding the day's aggregate.
+            if UInt64(attributes.fileSize ?? 0) < state.offset {
+                files.removeAll(); seen.removeAll(); tokens = 0; day = nil
+                return read(at: now, calendar: calendar)
+            }
+            do {
+                try handle.seek(toOffset: state.offset)
+                while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
+                    state.offset += UInt64(chunk.count)
+                    state.pending.append(chunk)
+                    while let newline = state.pending.firstIndex(of: 10) {
+                        let line = Data(state.pending.prefix(upTo: newline))
+                        state.pending.removeSubrange(...newline)
+                        guard line.range(of: Data("\"token_count\"".utf8)) != nil,
+                              let event = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                              event["type"] as? String == "event_msg",
+                              let stamp = event["timestamp"] as? String,
+                              let date = formatter.date(from: stamp) ?? plainFormatter.date(from: stamp),
+                              let payload = event["payload"] as? [String: Any], payload["type"] as? String == "token_count",
+                              let info = payload["info"] as? [String: Any],
+                              let usage = info["total_token_usage"] as? [String: Any],
+                              let total = (usage["total_tokens"] as? NSNumber)?.int64Value else { continue }
+                        let last = ((info["last_token_usage"] as? [String: Any])?["total_tokens"] as? NSNumber)?.int64Value ?? 0
+                        let delta = total >= state.previous ? total - state.previous : last
+                        state.previous = total
+                        guard date >= start, date < end else { continue }
+                        let key = "\(stamp)|\(total)|\(usage["input_tokens"] ?? 0)|\(usage["output_tokens"] ?? 0)"
+                        if seen.insert(key).inserted { tokens += max(0, delta) }
+                    }
+                }
+                files[url.path] = state
+            } catch { continue }
+        }
+        return tokens
+    }
+}
+
 private struct QuotaReading {
     let limits: RateLimits
     let resetCredits: ResetCredits?
@@ -348,6 +422,7 @@ private final class PanelState: ObservableObject {
     @Published var errorMessage: String?
     @Published var refreshInProgress = false
     @Published var tokenActivity: TokenActivity?
+    @Published var localTodayTokens: Int64?
     @Published var resetCredits: ResetCredits?
     @Published var comparison: ComparisonSnapshot?
 }
@@ -435,16 +510,19 @@ private struct QuotaPanel: View {
                             Text("Token 统计")
                                 .font(.system(size: 12, weight: .semibold))
                             Spacer()
-                            Text("账号数据")
+                            Text("本机 / 云端")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
                         HStack(spacing: 0) {
-                            tokenMetric("账号累计", value: state.tokenActivity?.lifetimeTokens)
+                            tokenMetric("今日本机估算", value: state.localTodayTokens)
                             Spacer()
-                            tokenMetric("\(latestDayLabel)用量", value: state.tokenActivity?.latestDay?.tokens)
+                            tokenMetric("账号累计", value: state.tokenActivity?.lifetimeTokens)
                         }
-                        Text("按日汇总可能延迟；这些 Token 不能换算成额度百分比。")
+                        Text("云端 \(latestDayLabel)汇总：\((state.tokenActivity?.latestDay?.tokens).map(formatTokens) ?? "暂无数据") · 可能延迟")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        Text("本机按本地日期汇总，含缓存输入；不含其他设备，不能换算额度。")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
@@ -667,6 +745,8 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private var tokenActivity: TokenActivity?
     private var resetCredits: ResetCredits?
     private let comparisonTracker = ComparisonTracker()
+    private let localTokenReader = LocalTokenReader()
+    private var localTodayTokens: Int64?
     private var comparison: ComparisonSnapshot?
     private var refreshInProgress = false
     private var refreshTimer: Timer?
@@ -716,11 +796,14 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
     private func refresh() {
         guard !refreshInProgress else { return }
         refreshInProgress = true
+        let tokenReader = localTokenReader
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let localToday = tokenReader.read()
             let result = Result { try QuotaReader.read() }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshInProgress = false
+                self.localTodayTokens = localToday
                 switch result {
                 case .success(let reading):
                     self.limits = reading.limits
@@ -760,6 +843,7 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
         panelState.errorMessage = errorMessage
         panelState.refreshInProgress = refreshInProgress
         panelState.tokenActivity = tokenActivity
+        panelState.localTodayTokens = localTodayTokens
         panelState.resetCredits = resetCredits
         panelState.comparison = comparison
     }
