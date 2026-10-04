@@ -623,7 +623,7 @@ private struct QuotaPanel: View {
                         .help("当前 5 小时额度已使用的比例")
                 }
             }
-            .foregroundStyle(usedColor)
+            .foregroundStyle(.white)
             .font(.system(size: 11, weight: .medium))
             HStack {
                 Text("重置于")
