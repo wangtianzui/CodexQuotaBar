@@ -152,6 +152,7 @@ private struct IdleQuotaReading: Codable {
 private struct ComparisonCache: Codable {
     let baseline: ComparisonBaseline?
     let idle: IdleQuotaReading?
+    let latest: IdleQuotaReading?
 }
 
 private struct ComparisonSnapshot {
@@ -165,6 +166,7 @@ private final class ComparisonTracker {
         .appendingPathComponent("Library/Application Support/CodexQuotaBar/comparison.json")
     private var baseline: ComparisonBaseline?
     private var idle: IdleQuotaReading?
+    private var latest: IdleQuotaReading?
     private var recoveryAttemptedFor: String?
 
     init() {
@@ -172,6 +174,7 @@ private final class ComparisonTracker {
            let cache = try? JSONDecoder().decode(ComparisonCache.self, from: data) {
             baseline = cache.baseline
             idle = cache.idle
+            latest = cache.latest
         } else if let data = UserDefaults.standard.data(forKey: storageKey) {
             baseline = try? JSONDecoder().decode(ComparisonBaseline.self, from: data)
             save()
@@ -187,7 +190,7 @@ private final class ComparisonTracker {
     private func save() {
         do {
             try FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(ComparisonCache(baseline: baseline, idle: idle))
+            let data = try JSONEncoder().encode(ComparisonCache(baseline: baseline, idle: idle, latest: latest))
             try data.write(to: cacheURL, options: .atomic)
         } catch {
             QuotaLog.write("Comparison cache save failed: \(error.localizedDescription)")
@@ -201,6 +204,11 @@ private final class ComparisonTracker {
               let duration = five.windowDurationMins else { return nil }
         let now = date.timeIntervalSince1970
         let windowStart = fiveReset - Double(duration * 60)
+        // Keep the reading before a rollover, even when no zero-use poll occurs.
+        defer {
+            latest = IdleQuotaReading(weeklyResetAt: weeklyReset, weeklyUsed: weeklyUsed, recordedAt: now)
+            save()
+        }
         if fiveUsed == 0 || now >= fiveReset {
             idle = IdleQuotaReading(weeklyResetAt: weeklyReset, weeklyUsed: weeklyUsed, recordedAt: now)
             if fiveUsed == 0 {
@@ -213,10 +221,9 @@ private final class ComparisonTracker {
             fiveUsed < (baseline?.fiveHourUsed ?? 0) || weeklyUsed < (baseline?.weeklyUsed ?? 0) {
             // The last idle poll belongs to the moment before first use. Avoid
             // treating a stale cache from hours ago as the start of this window.
-            let startReading = idle.flatMap { reading -> IdleQuotaReading? in
-                guard sameReset(reading.weeklyResetAt, weeklyReset), reading.weeklyUsed <= weeklyUsed,
-                      reading.recordedAt <= windowStart + 2, windowStart - reading.recordedAt <= 120 else { return nil }
-                return reading
+            let startReading = [latest, idle].compactMap { $0 }.sorted { $0.recordedAt > $1.recordedAt }.first { reading in
+                sameReset(reading.weeklyResetAt, weeklyReset) && reading.weeklyUsed <= weeklyUsed &&
+                    reading.recordedAt <= windowStart + 2 && windowStart - reading.recordedAt <= 120
             }
             baseline = ComparisonBaseline(
                 fiveHourResetAt: fiveReset,
@@ -610,7 +617,7 @@ private struct QuotaPanel: View {
             HStack(spacing: 8) {
                 if isWeekly {
                     Text(weeklyChangeLabel)
-                        .help(state.comparison?.coversWindowStart == true ? "本轮 5 小时内，7 天剩余额度下降的百分点" : "下一次 5 小时重置后开始记录整轮变化")
+                        .help(state.comparison?.coversWindowStart == true ? "本轮 5 小时内，7 天剩余额度下降的百分点" : "缺少窗口开始前的读数；只统计工具记录到的变化，完整减幅可能更大")
                 } else {
                     Text(used.map { "5小时 −\(Int($0.rounded()))%" } ?? "5小时 —%")
                         .help("当前 5 小时额度已使用的比例")
@@ -691,7 +698,10 @@ private struct QuotaPanel: View {
     }
 
     private var weeklyChangeLabel: String {
-        guard let comparison = state.comparison, comparison.coversWindowStart else { return "7天 —%" }
+        guard let comparison = state.comparison else { return "7天 —%" }
+        if !comparison.coversWindowStart {
+            return comparison.weeklyIncrease > 0 ? "7天 至少 −\(formatPoints(comparison.weeklyIncrease))%" : "7天 —%"
+        }
         return "7天 −\(formatPoints(comparison.weeklyIncrease))%"
     }
 
