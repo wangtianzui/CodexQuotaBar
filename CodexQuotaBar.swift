@@ -374,6 +374,8 @@ private final class QuotaReadTrace: @unchecked Sendable {
     private var firstOutputMs: Int?
     private var initializeResponseMs: Int?
     private var rateLimitsResponseMs: Int?
+    private var detailRetryStartedAt: UInt64?
+    private var detailRetryResponseMs: Int?
     private var usageResponseMs: Int?
     private var responseIDs = Set<Int>()
     private var malformedLines = 0
@@ -403,6 +405,12 @@ private final class QuotaReadTrace: @unchecked Sendable {
         lock.unlock()
     }
 
+    func markDetailRetrySent() {
+        lock.lock()
+        detailRetryStartedAt = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
     func noteOutput() {
         lock.lock()
         defer { lock.unlock() }
@@ -421,6 +429,8 @@ private final class QuotaReadTrace: @unchecked Sendable {
             if let initializeStartedAt { initializeResponseMs = elapsedMilliseconds(since: initializeStartedAt) }
         case 2:
             if let quotaStartedAt { rateLimitsResponseMs = elapsedMilliseconds(since: quotaStartedAt) }
+        case 4:
+            if let detailRetryStartedAt { detailRetryResponseMs = elapsedMilliseconds(since: detailRetryStartedAt) }
         case 3:
             if let usageStartedAt { usageResponseMs = elapsedMilliseconds(since: usageStartedAt) }
         default: break
@@ -440,6 +450,7 @@ private final class QuotaReadTrace: @unchecked Sendable {
         let firstOutput = firstOutputMs
         let initialize = initializeResponseMs
         let rateLimits = rateLimitsResponseMs
+        let detailRetry = detailRetryResponseMs
         let usage = usageResponseMs
         let ids = responseIDs.sorted().map(String.init).joined(separator: ",")
         let malformed = malformedLines
@@ -447,7 +458,7 @@ private final class QuotaReadTrace: @unchecked Sendable {
         lock.unlock()
 
         func ms(_ value: Int?) -> String { value.map(String.init) ?? "-" }
-        return "spawn=\(ms(launch))ms firstOutput=\(ms(firstOutput))ms init=\(ms(initialize))ms rateLimits=\(ms(rateLimits))ms usage=\(ms(usage))ms responseIDs=\(ids.isEmpty ? "-" : ids) malformed=\(malformed) malformedShape=\(malformedDetail) processRunning=\(processRunning) \(stderr)"
+        return "spawn=\(ms(launch))ms firstOutput=\(ms(firstOutput))ms init=\(ms(initialize))ms rateLimits=\(ms(rateLimits))ms detailRetry=\(ms(detailRetry))ms usage=\(ms(usage))ms responseIDs=\(ids.isEmpty ? "-" : ids) malformed=\(malformed) malformedShape=\(malformedDetail) processRunning=\(processRunning) \(stderr)"
     }
 
     private func elapsedMilliseconds(since start: UInt64) -> Int {
@@ -564,12 +575,15 @@ private final class QuotaReader {
 
         let initializeReady = DispatchSemaphore(value: 0)
         let quotaReady = DispatchSemaphore(value: 0)
+        let detailsReady = DispatchSemaphore(value: 0)
         let usageReady = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var initializeFailure: String?
         var quotaAnswer: Result<RateLimits, Error>?
         var resetCredits: ResetCredits?
         var tokenAnswer: TokenActivity?
+        var detailsRetryRequested = false
+        var detailsRetryResolved = false
         DispatchQueue.global(qos: .utility).async {
             var buffer = Data()
             var hasInitialize = false
@@ -599,6 +613,11 @@ private final class QuotaReader {
                             lock.unlock()
                             hasQuota = true
                             quotaReady.signal()
+                        } else if shape.id == 4 {
+                            lock.lock()
+                            detailsRetryResolved = true
+                            lock.unlock()
+                            detailsReady.signal()
                         }
                         continue
                     }
@@ -611,19 +630,42 @@ private final class QuotaReader {
                         lock.unlock()
                         hasInitialize = true
                         initializeReady.signal()
-                    } else if response.id == 2 {
+                    } else if response.id == 2 || response.id == 4 {
                         let result: Result<RateLimits, Error>
                         if let limits = response.result?.rateLimits {
                             result = .success(limits)
                         } else {
                             result = .failure(QuotaError.unavailable(response.error?.message ?? "Codex 未返回额度数据。请检查登录状态。"))
                         }
+                        let credits = response.result?.rateLimitResetCredits
+                        var shouldRetryDetails = false
                         lock.lock()
-                        quotaAnswer = result
-                        resetCredits = response.result?.rateLimitResetCredits
+                        if response.id == 2 {
+                            quotaAnswer = result
+                        } else if case .success = result {
+                            quotaAnswer = result
+                        }
+                        resetCredits = credits
+                        if response.id == 2 {
+                            shouldRetryDetails = !detailsRetryRequested &&
+                                (credits?.availableCount ?? 0) > 0 &&
+                                credits?.credits == nil
+                            if shouldRetryDetails { detailsRetryRequested = true }
+                        } else {
+                            detailsRetryResolved = true
+                        }
                         lock.unlock()
-                        hasQuota = true
-                        quotaReady.signal()
+                        if shouldRetryDetails {
+                            trace.markDetailRetrySent()
+                            let detailRequest = #"{"id":4,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":false}}"# + "\n"
+                            input.fileHandleForWriting.write(Data(detailRequest.utf8))
+                        }
+                        if response.id == 2 {
+                            hasQuota = true
+                            quotaReady.signal()
+                        } else {
+                            detailsReady.signal()
+                        }
                     } else if response.id == 3 {
                         lock.lock()
                         if let usage = response.result {
@@ -636,7 +678,10 @@ private final class QuotaReader {
                         hasUsage = true
                         usageReady.signal()
                     }
-                    if hasQuota && hasUsage { return }
+                    lock.lock()
+                    let detailPending = detailsRetryRequested && !detailsRetryResolved
+                    lock.unlock()
+                    if hasQuota && hasUsage && !detailPending { return }
                 }
             }
             if !hasInitialize {
@@ -652,6 +697,11 @@ private final class QuotaReader {
                 quotaReady.signal()
             }
             if !hasUsage { usageReady.signal() }
+            lock.lock()
+            let detailPending = detailsRetryRequested && !detailsRetryResolved
+            if detailPending { detailsRetryResolved = true }
+            lock.unlock()
+            if detailPending { detailsReady.signal() }
         }
 
         let initializeRequest = #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-quota-bar","version":"1.0"}}}"# + "\n"
@@ -680,11 +730,13 @@ private final class QuotaReader {
         }
         lock.lock()
         let quota = quotaAnswer
-        let credits = resetCredits
+        let detailsPending = detailsRetryRequested && !detailsRetryResolved
         lock.unlock()
         let limits = try quota!.get()
+        if detailsPending { _ = detailsReady.wait(timeout: .now() + 8) }
         _ = usageReady.wait(timeout: .now() + 2)
         lock.lock()
+        let credits = resetCredits
         let tokens = tokenAnswer
         lock.unlock()
         let diagnostics = trace.summary(stderr: stderrCollector.summary(), processRunning: process.isRunning)

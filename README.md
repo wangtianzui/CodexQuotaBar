@@ -48,7 +48,7 @@ swiftc -O -framework AppKit -framework SwiftUI CodexQuotaBar.swift -o CodexQuota
 
 ## 排查问题
 
-额度读数、基准恢复结果和读取失败原因记录在 `~/Library/Logs/CodexQuotaBar/quota.log`。CLI 启动、首个输出、初始化、额度与用量响应耗时、重置券数量/明细状态，以及标准错误的字节数/已知错误标记和无法解码 RPC 响应的字段名/类型，记录在 `quota-diagnostics.log`。诊断日志不保存原始标准错误、RPC 字段值、会话内容或登录令牌；单个日志超过 256 KB 后重新开始记录。
+额度读数、基准恢复结果和读取失败原因记录在 `~/Library/Logs/CodexQuotaBar/quota.log`。CLI 启动、首个输出、初始化、额度与用量响应耗时、重置券数量/明细状态，以及标准错误的字节数/已知错误标记和无法解码 RPC 响应的字段名/类型，记录在 `quota-diagnostics.log`。当接口只返回可用数量而暂时没有明细时，程序会再次调用只读的 `account/rateLimits/read` 请求明细；不会调用重置券消费接口。诊断日志不保存原始标准错误、RPC 字段值、会话内容或登录令牌；单个日志超过 256 KB 后重新开始记录。
 
 ## 验证（1.15）
 
