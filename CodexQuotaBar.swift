@@ -779,9 +779,7 @@ private struct QuotaPanel: View {
                     quotaCard(title: "5 小时", symbol: "clock", window: state.short, color: fiveHourColor, isWeekly: false)
                     quotaCard(title: "7 天", symbol: "calendar", window: state.weekly, color: weeklyColor, isWeekly: true)
 
-                    if let resetCredits = state.resetCredits {
-                        resetCreditCard(resetCredits)
-                    }
+                    resetCreditCard(state.resetCredits)
 
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -917,31 +915,43 @@ private struct QuotaPanel: View {
         }
     }
 
-    private func resetCreditCard(_ summary: ResetCredits) -> some View {
-        let available = (summary.credits ?? [])
-            .filter { $0.status == "available" && ($0.expiresAt ?? 0) > Date().timeIntervalSince1970 }
+    @ViewBuilder
+    private func resetCreditCard(_ summary: ResetCredits?) -> some View {
+        let now = Date().timeIntervalSince1970
+        let available = (summary?.credits ?? [])
+            .filter { $0.status == "available" && ($0.expiresAt.map { $0 > now } ?? true) }
             .sorted { ($0.expiresAt ?? .infinity) < ($1.expiresAt ?? .infinity) }
-        return VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("额度重置券", systemImage: "arrow.counterclockwise.circle")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text("可用 \(summary.availableCount) 次")
+                Text(summary.map { "可用 \($0.availableCount) 次" } ?? (state.refreshInProgress ? "读取中…" : "暂不可用"))
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(fiveHourColor)
             }
-            ForEach(Array(available.enumerated()), id: \.offset) { index, credit in
-                HStack {
-                    Text("第 \(index + 1) 次")
+            if let summary {
+                if summary.credits == nil {
+                    Text("有效期明细暂不可用")
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(credit.expiresAt.map { "有效期至 \(formatCreditExpiry($0))" } ?? "有效期未知")
-                        .monospacedDigit()
+                } else if available.isEmpty {
+                    Text(summary.availableCount == 0 ? "暂无可用重置券" : "暂无可展示的券明细")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
-                .font(.system(size: 11))
-            }
-            if available.isEmpty {
-                Text("暂无可用重置券")
+                ForEach(Array(available.enumerated()), id: \.offset) { index, credit in
+                    HStack {
+                        Text("第 \(index + 1) 次")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(credit.expiresAt.map { "有效期至 \(formatCreditExpiry($0))" } ?? "永久有效")
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11))
+                }
+            } else {
+                Text("当前接口未返回重置券数据")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -1094,7 +1104,14 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
                     self.resetCredits = reading.resetCredits
                     self.comparison = self.comparisonTracker.update(reading.limits, at: self.lastUpdated!)
                     QuotaLog.write("Quota: fiveUsed=\(reading.limits.primary?.usedPercent.map { String($0) } ?? "nil"), weeklyUsed=\(reading.limits.secondary?.usedPercent.map { String($0) } ?? "nil"), weeklyChange=\(self.comparison?.weeklyIncrease.description ?? "nil"), completeBaseline=\(self.comparison?.coversWindowStart.description ?? "nil")")
-                    QuotaLog.writeDiagnostic("Quota read succeeded: \(reading.diagnostics)")
+                    let resetCreditDiagnostic: String
+                    if let resetCredits = reading.resetCredits {
+                        let detailCount = resetCredits.credits.map { String($0.count) } ?? "null"
+                        resetCreditDiagnostic = "resetCredits=count:\(resetCredits.availableCount),details:\(detailCount)"
+                    } else {
+                        resetCreditDiagnostic = "resetCredits=missing"
+                    }
+                    QuotaLog.writeDiagnostic("Quota read succeeded: \(reading.diagnostics) \(resetCreditDiagnostic)")
                 case .failure(let error):
                     self.errorMessage = error.localizedDescription
                     QuotaLog.write("Quota refresh failed: \(error.localizedDescription)")
