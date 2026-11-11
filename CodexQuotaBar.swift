@@ -22,7 +22,7 @@ private struct RateLimitResponse: Decodable {
 
 private struct ResetCredits: Decodable {
     let availableCount: Int
-    let credits: [ResetCredit]
+    let credits: [ResetCredit]?
 }
 
 private struct ResetCredit: Decodable {
@@ -122,6 +122,7 @@ private struct QuotaReading {
     let limits: RateLimits
     let resetCredits: ResetCredits?
     let tokenActivity: TokenActivity?
+    let diagnostics: String
 }
 
 private enum CodexIcon {
@@ -287,9 +288,17 @@ private final class ComparisonTracker {
 
 private enum QuotaLog {
     static func write(_ message: String) {
+        write(message, to: "quota.log")
+    }
+
+    static func writeDiagnostic(_ message: String) {
+        write(message, to: "quota-diagnostics.log")
+    }
+
+    private static func write(_ message: String, to fileName: String) {
         let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/CodexQuotaBar")
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let file = folder.appendingPathComponent("quota.log")
+        let file = folder.appendingPathComponent(fileName)
         let entry = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
         guard let data = entry.data(using: .utf8) else { return }
         if let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 262144 {
@@ -313,16 +322,201 @@ private struct RPCError: Decodable {
     let message: String?
 }
 
+private final class StderrCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private let sampleLimit = 4096
+    private var byteCount = 0
+    private var sample = Data()
+
+    func append(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        byteCount += data.count
+        let remaining = sampleLimit - sample.count
+        if remaining > 0 {
+            sample.append(contentsOf: data.prefix(remaining))
+        }
+    }
+
+    func summary() -> String {
+        lock.lock()
+        let bytes = byteCount
+        let captured = sample
+        lock.unlock()
+
+        guard bytes > 0 else { return "stderr=0B" }
+        let text = String(decoding: captured, as: UTF8.self).lowercased()
+        let markers: [(String, String)] = [
+            ("401", "http401"), ("unauthorized", "unauthorized"),
+            ("403", "http403"), ("forbidden", "forbidden"),
+            ("429", "http429"), ("rate limit", "rate-limit"), ("rate_limit", "rate-limit"),
+            ("timed out", "timeout"), ("timeout", "timeout"),
+            ("connection refused", "connection-refused"), ("connection reset", "connection-reset"),
+            ("could not resolve", "dns"), ("failed to resolve", "dns"), ("dns", "dns"),
+            ("tls", "tls"), ("ssl", "tls")
+        ]
+        var hints: [String] = []
+        for (marker, label) in markers where text.contains(marker) && !hints.contains(label) {
+            hints.append(label)
+        }
+        let hintSummary = hints.isEmpty ? "unclassified" : hints.joined(separator: ",")
+        return "stderr=\(bytes)B[\(hintSummary)]"
+    }
+}
+
+private final class QuotaReadTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private let createdAt = DispatchTime.now().uptimeNanoseconds
+    private var initializeStartedAt: UInt64?
+    private var quotaStartedAt: UInt64?
+    private var usageStartedAt: UInt64?
+    private var processLaunchMs: Int?
+    private var firstOutputMs: Int?
+    private var initializeResponseMs: Int?
+    private var rateLimitsResponseMs: Int?
+    private var usageResponseMs: Int?
+    private var responseIDs = Set<Int>()
+    private var malformedLines = 0
+    private var malformedSummary: String?
+
+    func markProcessLaunched() {
+        lock.lock()
+        processLaunchMs = elapsedMilliseconds(since: createdAt)
+        lock.unlock()
+    }
+
+    func markInitializeSent() {
+        lock.lock()
+        initializeStartedAt = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    func markQuotaRequestSent() {
+        lock.lock()
+        quotaStartedAt = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    func markUsageRequestSent() {
+        lock.lock()
+        usageStartedAt = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    func noteOutput() {
+        lock.lock()
+        defer { lock.unlock() }
+        if firstOutputMs == nil, let initializeStartedAt {
+            firstOutputMs = elapsedMilliseconds(since: initializeStartedAt)
+        }
+    }
+
+    func noteResponse(id: Int?) {
+        guard let id else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        responseIDs.insert(id)
+        switch id {
+        case 1:
+            if let initializeStartedAt { initializeResponseMs = elapsedMilliseconds(since: initializeStartedAt) }
+        case 2:
+            if let quotaStartedAt { rateLimitsResponseMs = elapsedMilliseconds(since: quotaStartedAt) }
+        case 3:
+            if let usageStartedAt { usageResponseMs = elapsedMilliseconds(since: usageStartedAt) }
+        default: break
+        }
+    }
+
+    func noteMalformedLine(_ summary: String) {
+        lock.lock()
+        malformedLines += 1
+        if malformedSummary == nil { malformedSummary = summary }
+        lock.unlock()
+    }
+
+    func summary(stderr: String, processRunning: Bool) -> String {
+        lock.lock()
+        let launch = processLaunchMs
+        let firstOutput = firstOutputMs
+        let initialize = initializeResponseMs
+        let rateLimits = rateLimitsResponseMs
+        let usage = usageResponseMs
+        let ids = responseIDs.sorted().map(String.init).joined(separator: ",")
+        let malformed = malformedLines
+        let malformedDetail = malformedSummary ?? "-"
+        lock.unlock()
+
+        func ms(_ value: Int?) -> String { value.map(String.init) ?? "-" }
+        return "spawn=\(ms(launch))ms firstOutput=\(ms(firstOutput))ms init=\(ms(initialize))ms rateLimits=\(ms(rateLimits))ms usage=\(ms(usage))ms responseIDs=\(ids.isEmpty ? "-" : ids) malformed=\(malformed) malformedShape=\(malformedDetail) processRunning=\(processRunning) \(stderr)"
+    }
+
+    private func elapsedMilliseconds(since start: UInt64) -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+    }
+}
+
+private enum RPCLineShape {
+    static func inspect(_ data: Data) -> (id: Int?, summary: String) {
+        guard let value = try? JSONSerialization.jsonObject(with: data) else {
+            return (nil, "json=invalid")
+        }
+        guard let object = value as? [String: Any] else {
+            return (nil, "root=\(shape(value, depth: 0))")
+        }
+
+        let id = (object["id"] as? NSNumber)?.intValue
+        let keys = object.keys.sorted().prefix(12).joined(separator: ",")
+        let errorCode = ((object["error"] as? [String: Any])?["code"] as? NSNumber)?.stringValue ?? "-"
+        let summary = "id=\(id.map(String.init) ?? "-") keys={\(keys)} code=\(errorCode) result=\(shape(object["result"], depth: 0)) error=\(shape(object["error"], depth: 0))"
+        return (id, String(summary.prefix(700)))
+    }
+
+    private static func shape(_ value: Any?, depth: Int) -> String {
+        guard let value else { return "absent" }
+        if value is NSNull { return "null" }
+        if let object = value as? [String: Any] {
+            guard depth < 4 else { return "object" }
+            let keys = object.keys.sorted()
+            let fields = keys.prefix(10).map { "\($0):\(shape(object[$0], depth: depth + 1))" }
+            let remainder = keys.count > 10 ? ",+\(keys.count - 10)" : ""
+            return "object{\(fields.joined(separator: ","))\(remainder)}"
+        }
+        if let array = value as? [Any] {
+            return array.first.map { "array[\(array.count)]<\(shape($0, depth: depth + 1))>" } ?? "array[0]"
+        }
+        if value is String { return "string" }
+        if value is NSNumber { return "number" }
+        return "other"
+    }
+}
+
 private enum QuotaError: LocalizedError {
     case cliMissing
-    case timeout
+    case timeout(String)
     case unavailable(String)
+    case malformedRateLimits(String)
+
+    var diagnosticDescription: String? {
+        switch self {
+        case .timeout(let details), .malformedRateLimits(let details): return details
+        default: return nil
+        }
+    }
+
+    var diagnosticLabel: String? {
+        switch self {
+        case .timeout: return "Quota read timeout"
+        case .malformedRateLimits: return "Malformed rateLimits response"
+        default: return nil
+        }
+    }
 
     var errorDescription: String? {
         switch self {
         case .cliMissing: return "找不到 Codex CLI。请安装或更新 Codex 桌面应用。"
         case .timeout: return "读取额度超时。"
         case .unavailable(let message): return message
+        case .malformedRateLimits: return "Codex 返回的额度数据格式无法识别。"
         }
     }
 }
@@ -345,42 +539,79 @@ private final class QuotaReader {
         process.arguments = ["app-server"]
         let input = Pipe()
         let output = Pipe()
+        let stderrPipe = Pipe()
+        let stderrHandle = stderrPipe.fileHandleForReading
+        let stderrCollector = StderrCollector()
+        let trace = QuotaReadTrace()
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrPipe
+        stderrHandle.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+            } else {
+                stderrCollector.append(chunk)
+            }
+        }
         try process.run()
+        trace.markProcessLaunched()
         defer {
             if process.isRunning { process.terminate() }
             input.fileHandleForWriting.closeFile()
+            stderrHandle.readabilityHandler = nil
         }
 
-        let requests = [
-            #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-quota-bar","version":"1.0"}}}"#,
-            #"{"method":"initialized"}"#,
-            #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":false}}"#,
-            #"{"id":3,"method":"account/usage/read","params":{}}"#
-        ].joined(separator: "\n") + "\n"
-        input.fileHandleForWriting.write(Data(requests.utf8))
-
+        let initializeReady = DispatchSemaphore(value: 0)
         let quotaReady = DispatchSemaphore(value: 0)
         let usageReady = DispatchSemaphore(value: 0)
         let lock = NSLock()
+        var initializeFailure: String?
         var quotaAnswer: Result<RateLimits, Error>?
         var resetCredits: ResetCredits?
         var tokenAnswer: TokenActivity?
         DispatchQueue.global(qos: .utility).async {
             var buffer = Data()
+            var hasInitialize = false
             var hasQuota = false
             var hasUsage = false
             while true {
                 let chunk = output.fileHandleForReading.availableData
                 if chunk.isEmpty { break }
+                trace.noteOutput()
                 buffer.append(chunk)
                 while let newline = buffer.firstIndex(of: 10) {
                     let line = buffer.prefix(upTo: newline)
                     buffer.removeSubrange(...newline)
-                    guard let response = try? JSONDecoder().decode(RPCResponse.self, from: Data(line)) else { continue }
-                    if response.id == 2 {
+                    let lineData = Data(line)
+                    guard let response = try? JSONDecoder().decode(RPCResponse.self, from: lineData) else {
+                        let shape = RPCLineShape.inspect(lineData)
+                        trace.noteMalformedLine(shape.summary)
+                        if shape.id == 1 {
+                            lock.lock()
+                            initializeFailure = "Codex 初始化响应格式无法识别。"
+                            lock.unlock()
+                            hasInitialize = true
+                            initializeReady.signal()
+                        } else if shape.id == 2 {
+                            lock.lock()
+                            quotaAnswer = .failure(QuotaError.malformedRateLimits(shape.summary))
+                            lock.unlock()
+                            hasQuota = true
+                            quotaReady.signal()
+                        }
+                        continue
+                    }
+                    trace.noteResponse(id: response.id)
+                    if response.id == 1 {
+                        lock.lock()
+                        if let message = response.error?.message {
+                            initializeFailure = "Codex 初始化失败：\(message)"
+                        }
+                        lock.unlock()
+                        hasInitialize = true
+                        initializeReady.signal()
+                    } else if response.id == 2 {
                         let result: Result<RateLimits, Error>
                         if let limits = response.result?.rateLimits {
                             result = .success(limits)
@@ -408,6 +639,12 @@ private final class QuotaReader {
                     if hasQuota && hasUsage { return }
                 }
             }
+            if !hasInitialize {
+                lock.lock()
+                if initializeFailure == nil { initializeFailure = "Codex 连接已关闭。请检查登录状态。" }
+                lock.unlock()
+                initializeReady.signal()
+            }
             if !hasQuota {
                 lock.lock()
                 quotaAnswer = .failure(QuotaError.unavailable("Codex 连接已关闭。请检查登录状态。"))
@@ -416,14 +653,42 @@ private final class QuotaReader {
             }
             if !hasUsage { usageReady.signal() }
         }
-        guard quotaReady.wait(timeout: .now() + 15) == .success else { throw QuotaError.timeout }
-        _ = usageReady.wait(timeout: .now() + 2)
+
+        let initializeRequest = #"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-quota-bar","version":"1.0"}}}"# + "\n"
+        trace.markInitializeSent()
+        input.fileHandleForWriting.write(Data(initializeRequest.utf8))
+        guard initializeReady.wait(timeout: .now() + 15) == .success else {
+            let diagnostics = trace.summary(stderr: stderrCollector.summary(), processRunning: process.isRunning)
+            throw QuotaError.timeout(diagnostics)
+        }
+        lock.lock()
+        let initFailure = initializeFailure
+        lock.unlock()
+        if let initFailure { throw QuotaError.unavailable(initFailure) }
+
+        let quotaRequests = [
+            #"{"method":"initialized"}"#,
+            #"{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":false}}"#,
+            #"{"id":3,"method":"account/usage/read","params":{}}"#
+        ].joined(separator: "\n") + "\n"
+        trace.markQuotaRequestSent()
+        trace.markUsageRequestSent()
+        input.fileHandleForWriting.write(Data(quotaRequests.utf8))
+        guard quotaReady.wait(timeout: .now() + 45) == .success else {
+            let diagnostics = trace.summary(stderr: stderrCollector.summary(), processRunning: process.isRunning)
+            throw QuotaError.timeout(diagnostics)
+        }
         lock.lock()
         let quota = quotaAnswer
         let credits = resetCredits
+        lock.unlock()
+        let limits = try quota!.get()
+        _ = usageReady.wait(timeout: .now() + 2)
+        lock.lock()
         let tokens = tokenAnswer
         lock.unlock()
-        return QuotaReading(limits: try quota!.get(), resetCredits: credits, tokenActivity: tokens)
+        let diagnostics = trace.summary(stderr: stderrCollector.summary(), processRunning: process.isRunning)
+        return QuotaReading(limits: limits, resetCredits: credits, tokenActivity: tokens, diagnostics: diagnostics)
     }
 }
 
@@ -653,7 +918,7 @@ private struct QuotaPanel: View {
     }
 
     private func resetCreditCard(_ summary: ResetCredits) -> some View {
-        let available = summary.credits
+        let available = (summary.credits ?? [])
             .filter { $0.status == "available" && ($0.expiresAt ?? 0) > Date().timeIntervalSince1970 }
             .sorted { ($0.expiresAt ?? .infinity) < ($1.expiresAt ?? .infinity) }
         return VStack(alignment: .leading, spacing: 8) {
@@ -829,9 +1094,15 @@ private final class QuotaBar: NSObject, NSApplicationDelegate, NSPopoverDelegate
                     self.resetCredits = reading.resetCredits
                     self.comparison = self.comparisonTracker.update(reading.limits, at: self.lastUpdated!)
                     QuotaLog.write("Quota: fiveUsed=\(reading.limits.primary?.usedPercent.map { String($0) } ?? "nil"), weeklyUsed=\(reading.limits.secondary?.usedPercent.map { String($0) } ?? "nil"), weeklyChange=\(self.comparison?.weeklyIncrease.description ?? "nil"), completeBaseline=\(self.comparison?.coversWindowStart.description ?? "nil")")
+                    QuotaLog.writeDiagnostic("Quota read succeeded: \(reading.diagnostics)")
                 case .failure(let error):
                     self.errorMessage = error.localizedDescription
                     QuotaLog.write("Quota refresh failed: \(error.localizedDescription)")
+                    if let quotaError = error as? QuotaError,
+                       let label = quotaError.diagnosticLabel,
+                       let details = quotaError.diagnosticDescription {
+                        QuotaLog.writeDiagnostic("\(label): \(details)")
+                    }
                 }
                 self.render()
             }
